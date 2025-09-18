@@ -1,0 +1,437 @@
+#define BLYNK_TEMPLATE_ID   "TMPL31SXFse7w"
+#define BLYNK_DEVICE_NAME   "sleves"
+#define BLYNK_AUTH_TOKEN    "ca574Kg-bq0dN46EZF7_30Kq_1aM0fYU"
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "Hackathon_Z3";      // Your WiFi SSID
+char pass[] = "Hack@1725";  // Your WiFi Password
+
+#include <Wire.h>
+#include <MPU6050.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+
+
+void updateSimulatedValues();
+void indicateModeChange();
+void processBicepCurl();
+bool pitchReachedThreshold();
+void processHeartRateSpO2();
+int filterHeartRate(int32_t hr, int8_t valid);
+int filterSPO2(int32_t sp, int8_t valid);
+void processShoulderExtension();
+bool rollReachedThreshold();
+
+// ---------------- PIN CONFIG ----------------
+const int greenLED = 16;    // GOOD movement
+const int redLED = 17;      // BAD movement
+const int motorPin = 23;    // Vibration motor
+const int buzzerPin = 4;    // Buzzer
+const int joystickPin = 34; // VRx for mode toggle
+const int centerButtonPin = 18; // Center button (SW) for Mode 2
+
+// ---------------- MPU6050 ----------------
+MPU6050 mpu;
+float accX, accY, accZ;
+float pitch, roll;
+bool goingUp = false;
+bool shoulderExtended = false;
+
+// ---------------- MAX30102 ----------------
+MAX30105 particleSensor;
+#undef BUFFER_SIZE
+const int BUFFER_SIZE = 100; // Samples for calculation
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+int32_t spo2;
+int8_t validSPO2;
+int32_t heartRate;
+int8_t validHeartRate;
+
+// ---------------- HEART RATE & SPO2 FILTERING ----------------
+const int HR_SAMPLES = 5;
+const int SPO2_SAMPLES = 5;
+int hrReadings[HR_SAMPLES];
+int spo2Readings[SPO2_SAMPLES];
+int hrIndex = 0;
+int spo2Index = 0;
+int hrTotal = 0;
+int spo2Total = 0;
+int hrAverage = 0;
+int spo2Average = 0;
+bool firstHRReading = true;
+bool firstSPO2Reading = true;
+
+// ---------------- SIMULATED VALUES ----------------
+unsigned long lastSimulatedUpdate = 0;
+const long SIMULATED_UPDATE_INTERVAL = 10000; // 10 seconds
+int simulatedHR = 72;
+int simulatedSPO2 = 98;
+
+// ---------------- MODE CONTROL ----------------
+int currentMode = 0; // 0 = No mode, 1 = Bicep Curl, 2 = HR/SpO2, 3 = Shoulder Extension
+bool centerButtonPressed = false;
+bool modeToggleState = false; // false = Mode 1, true = Mode 3
+
+BlynkTimer timer;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22); // SDA, SCL
+    // Connect WiFi + Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  Serial.println("Connecting to Blynk...");
+
+  // Pin modes
+  pinMode(greenLED, OUTPUT);
+  pinMode(redLED, OUTPUT);
+  pinMode(motorPin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(centerButtonPin, INPUT_PULLUP);
+  digitalWrite(greenLED, LOW);
+  digitalWrite(redLED, LOW);
+  digitalWrite(motorPin, LOW);
+  digitalWrite(buzzerPin, LOW);
+
+  // Initialize filter arrays
+  for (int i = 0; i < HR_SAMPLES; i++) hrReadings[i] = 0;
+  for (int i = 0; i < SPO2_SAMPLES; i++) spo2Readings[i] = 0;
+
+  randomSeed(analogRead(0));
+
+  // MPU6050 init
+  mpu.initialize();
+  if (mpu.testConnection()) Serial.println("MPU6050 connected successfully!");
+  else { Serial.println("MPU6050 connection failed!"); while (1); }
+
+  // MAX30102 init
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("MAX30102 not found. Check wiring.");
+    while (1);
+  }
+
+  // Configure MAX30102
+  byte ledBrightness = 0x1F;
+  byte sampleAverage = 4;
+  byte ledMode = 2;
+  int sampleRate = 100;
+  int pulseWidth = 411;
+  int adcRange = 4096;
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+  particleSensor.setPulseAmplitudeRed(0x1F);
+  particleSensor.setPulseAmplitudeIR(0x1F);
+
+  Serial.println("Smart Sleeve Ready!");
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+
+  int joystickValue = analogRead(joystickPin);
+  int centerButtonState = digitalRead(centerButtonPin);
+
+  // Update simulated values occasionally
+  if (millis() - lastSimulatedUpdate > SIMULATED_UPDATE_INTERVAL) {
+    updateSimulatedValues();
+    lastSimulatedUpdate = millis();
+  }
+
+  if (centerButtonState == LOW && !centerButtonPressed) {
+    centerButtonPressed = true;
+    currentMode = 2;
+    Serial.println("Switched to MODE 2: Heart Rate & SpO2");
+    // Process HR/SpO2 immediately
+    processHeartRateSpO2();
+    // Return to previous mode after HR/SpO2 measurement
+    currentMode = modeToggleState ? 3 : 1;
+    Serial.print("Returning to MODE ");
+    Serial.println(currentMode);
+    delay(500); // Debounce
+  } else if (centerButtonState == HIGH) {
+    centerButtonPressed = false;
+  }
+  
+  // Joystick toggle for Mode 1/Mode 3 selection
+  if (joystickValue < 1500 && !modeToggleState) {
+    // Switch to Mode 3 (Shoulder Extension)
+    modeToggleState = true;
+    currentMode = 3;
+    Serial.println("Switched to MODE 3: Shoulder Extension (X-axis)");
+    indicateModeChange();
+    delay(500); // Debounce
+  } 
+  else if (joystickValue > 2500 && modeToggleState) {
+    // Switch to Mode 1 (Bicep Curl)
+    modeToggleState = false;
+    currentMode = 1;
+    Serial.println("Switched to MODE 1: Bicep Curl (Y-axis)");
+    indicateModeChange();
+    delay(500);
+  }
+
+  // ---------------- PROCESS MODES ----------------
+  if (currentMode == 1) {
+    processBicepCurl();
+  } else if (currentMode == 3) {
+    processShoulderExtension();
+  }
+
+  }
+// Update simulated values with small random variations
+void updateSimulatedValues() {
+  // Small random variations to simulate natural fluctuations
+  int hrVariation = random(-3, 4); // -3 to +3 BPM variation
+  int spo2Variation = random(-1, 2); // -1 to +1% variation
+  
+  simulatedHR = constrain(simulatedHR + hrVariation, 65, 85);
+  simulatedSPO2 = constrain(simulatedSPO2 + spo2Variation, 96, 99);
+}
+
+// Visual indication of mode change
+void indicateModeChange() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(greenLED, HIGH);
+    digitalWrite(motorPin, HIGH);
+    delay(100);
+    digitalWrite(greenLED, LOW);
+    digitalWrite(motorPin, LOW);
+    delay(100);
+  }
+}
+
+// ---------------- MODE 1: BICEP CURL (Y-axis) ----------------
+void processBicepCurl() {
+  // Default: GOOD movement
+  digitalWrite(greenLED, HIGH);
+  digitalWrite(redLED, LOW);
+
+  // Read accelerometer
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  accX = (float)ax / 16384.0; // Convert to g
+  accY = (float)ay / 16384.0;
+  accZ = (float)az / 16384.0;
+  pitch = atan(accX / sqrt(accY * accY + accZ * accZ)) * 180 / PI;
+
+  // Detect upward movement
+  if (!goingUp && pitch > 30) goingUp = true;
+
+  // Detect downward movement
+  if (goingUp && pitch < 10) {
+    if (!pitchReachedThreshold()) { // BAD movement
+      digitalWrite(greenLED, LOW);
+      digitalWrite(redLED, HIGH);
+      digitalWrite(motorPin, HIGH);
+      digitalWrite(buzzerPin, HIGH);
+      Serial.println("BAD MOVEMENT - Incomplete curl");
+      delay(500);
+      digitalWrite(motorPin, LOW);
+      digitalWrite(buzzerPin, LOW);
+    } else {
+      Serial.println("GOOD MOVEMENT - Complete curl");
+    }
+    goingUp = false;
+  }
+  delay(100);
+}
+
+bool pitchReachedThreshold() {
+  return pitch > 50; // Threshold for GOOD curl
+}
+
+// ---------------- MODE 2: HEART RATE & SPO2 ----------------
+void processHeartRateSpO2() {
+  Serial.println("Measuring Heart Rate & SpO2...");
+  Serial.println("Please keep your finger still and firmly on the sensor.");
+  
+  // Indicate processing with LED and motor
+  digitalWrite(greenLED, HIGH);
+  digitalWrite(motorPin, HIGH);
+  delay(500);
+  digitalWrite(greenLED, LOW);
+  digitalWrite(motorPin, LOW);
+
+  // Collect samples
+  bool sensorDetected = false;
+  for (int i = 0; i < BUFFER_SIZE; i++) {
+    while (!particleSensor.available()) {
+      particleSensor.check();
+    }
+    
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample();
+    
+    // Check if we're getting reasonable sensor readings
+    if (irBuffer[i] > 50000 || redBuffer[i] > 50000) {
+      sensorDetected = true;
+    }
+    
+    // Show progress indicator
+    if (i % 25 == 0) {
+      Serial.print(".");
+    }
+    delay(35);
+  }
+  Serial.println();
+
+  int filteredHR = -1;
+  int filteredSPO2 = -1;
+
+  // Only try to compute if we detected reasonable sensor values
+  if (sensorDetected) {
+    // Compute heart rate & SpO2
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, BUFFER_SIZE, redBuffer,
+                                           &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+    // Filter and validate results
+    filteredHR = filterHeartRate(heartRate, validHeartRate);
+    filteredSPO2 = filterSPO2(spo2, validSPO2);
+  }
+
+  // If no valid reading, use simulated values
+  if (filteredHR <= 0) {
+    filteredHR = simulatedHR;
+    Serial.println("Using simulated heart rate (sensor not detected)");
+  }
+  
+  if (filteredSPO2 <= 0) {
+    filteredSPO2 = simulatedSPO2;
+    Serial.println("Using simulated SpO2 (sensor not detected)");
+  }
+
+  // Display results
+  Serial.println("===== Results =====");
+  Serial.print("Heart Rate: "); 
+  Serial.print(filteredHR); 
+  Serial.println(" BPM");
+
+  Serial.print("SpO2: "); 
+  Serial.print(filteredSPO2); 
+  Serial.println(" %");
+  
+  // Check if values are within typical healthy ranges
+  if (filteredHR < 50 || filteredHR > 120) {
+    Serial.println("Warning: Heart rate outside typical range");
+  }
+  if (filteredSPO2 < 95) {
+    Serial.println("Warning: SpO2 level below normal");
+  }
+  
+  Serial.println("===================");
+  
+  // Provide haptic feedback based on results
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(greenLED, HIGH);
+    delay(200);
+    digitalWrite(greenLED, LOW);
+    delay(200);
+  }
+  
+  delay(1000);
+}
+
+// Filter and validate heart rate reading
+int filterHeartRate(int32_t hr, int8_t valid) {
+  // Check if reading is valid and within physiological range
+  if (valid && hr >= 50 && hr <= 180) {
+    // Update moving average filter
+    hrTotal = hrTotal - hrReadings[hrIndex];
+    hrReadings[hrIndex] = hr;
+    hrTotal = hrTotal + hrReadings[hrIndex];
+    hrIndex = (hrIndex + 1) % HR_SAMPLES;
+    
+    // Calculate average
+    hrAverage = hrTotal / HR_SAMPLES;
+    
+    // Additional validation: check if the new reading is within 20% of average
+    if (!firstHRReading) {
+      float deviation = abs(hr - hrAverage) / (float)hrAverage;
+      if (deviation > 0.2) {
+        // Reading is too different from average, likely invalid
+        return -1;
+      }
+    }
+    
+    firstHRReading = false;
+    return hrAverage;
+  }
+  return -1; // Invalid reading
+}
+
+// Filter and validate SpO2 reading
+int filterSPO2(int32_t sp, int8_t valid) {
+  // Check if reading is valid and within physiological range
+  if (valid && sp >= 90 && sp <= 100) {
+    // Update moving average filter
+    spo2Total = spo2Total - spo2Readings[spo2Index];
+    spo2Readings[spo2Index] = sp;
+    spo2Total = spo2Total + spo2Readings[spo2Index];
+    spo2Index = (spo2Index + 1) % SPO2_SAMPLES;
+    
+    // Calculate average
+    spo2Average = spo2Total / SPO2_SAMPLES;
+    
+    // Additional validation: check if the new reading is within 5% of average
+    if (!firstSPO2Reading) {
+      float deviation = abs(sp - spo2Average) / (float)spo2Average;
+      if (deviation > 0.05) {
+        // Reading is too different from average, likely invalid
+        return -1;
+      }
+    }
+    
+    firstSPO2Reading = false;
+    return spo2Average;
+  }
+  return -1; // Invalid reading
+}
+
+// ---------------- MODE 3: SHOULDER EXTENSION (X-axis) ----------------
+void processShoulderExtension() {
+  // Default: GOOD movement
+  digitalWrite(greenLED, HIGH);
+  digitalWrite(redLED, LOW);
+
+  // Read accelerometer
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  accX = (float)ax / 16384.0; // Convert to g
+  accY = (float)ay / 16384.0;
+  accZ = (float)az / 16384.0;
+  
+  // Calculate roll (rotation around X-axis)
+  roll = atan(accY / sqrt(accX * accX + accZ * accZ)) * 180 / PI;
+
+  // Detect shoulder extension movement
+  if (!shoulderExtended && roll > 30) {
+    shoulderExtended = true;
+  }
+
+  // Detect shoulder return movement
+  if (shoulderExtended && roll < 10) {
+    if (!rollReachedThreshold()) { // BAD movement
+      digitalWrite(greenLED, LOW);
+      digitalWrite(redLED, HIGH);
+      digitalWrite(motorPin, HIGH);
+      digitalWrite(buzzerPin, HIGH);
+      Serial.println("BAD SHOULDER EXTENSION - Incomplete extension");
+      delay(500);
+      digitalWrite(motorPin, LOW);
+      digitalWrite(buzzerPin, LOW);
+    } else {
+      Serial.println("GOOD SHOULDER EXTENSION - Complete extension");
+    }
+    shoulderExtended = false;
+  }
+  delay(100);
+}
+
+bool rollReachedThreshold() {
+  return roll > 45; // Threshold for GOOD shoulder extension
+}
